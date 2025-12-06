@@ -1,7 +1,8 @@
-paddlepaddle==3.0.0b2
-paddleocr==2.9.2
+paddlepaddle==2.6.1
+paddleocr==2.7.3
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 python-multipart==0.0.20
-pillow==11.0.0
-numpy==1.26.4
+pillow==10.3.0
+numpy==1.24.3
+opencv-python-headless==4.9.0.80

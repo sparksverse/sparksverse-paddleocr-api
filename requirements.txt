@@ -1,4 +1,4 @@
-paddlepaddle==2.6.1
+paddlepaddle==2.6.2
 paddleocr==2.7.3
 fastapi==0.115.5
 uvicorn[standard]==0.32.1

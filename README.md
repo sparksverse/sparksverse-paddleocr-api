@@ -10,7 +10,7 @@ license: apache-2.0
 
 # Sparksverse PaddleOCR API
 
-High-accuracy OCR service powered by **PaddleOCR 3.0.3 (PP-OCRv5)** - June 2025 Release
+High-accuracy OCR service powered by **PaddleOCR 3.7.0 (PP-OCRv5)**
 
 ## 🌟 Features
 
@@ -87,7 +87,8 @@ Perfect for:
 
 ## 🔧 Technology Stack
 
-- **PaddleOCR**: 3.0.3 (PP-OCRv5)
+- **PaddleOCR**: 3.7.0 (PP-OCRv5) on PaddlePaddle 3.3.1
+- **Table recognition**: PP-StructureV3
 - **FastAPI**: Modern Python web framework
 - **Docker**: Containerized deployment
 

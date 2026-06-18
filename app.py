@@ -1,33 +1,45 @@
 """
 Sparksverse PaddleOCR API
-Based on PaddleOCR 3.0.3 (PP-OCRv5) - June 2025
-High accuracy Chinese OCR with no cost!
+Powered by PaddleOCR 3.x (PP-OCRv5)
 
 Endpoints:
-- POST /ocr - Text recognition
-- POST /ocr_table - Table recognition
+- POST /ocr        - Text recognition
+- POST /ocr_table  - Table recognition (PP-StructureV3)
+
+Migration note (2.x -> 3.x):
+- `use_angle_cls`  -> `use_textline_orientation`
+- `use_gpu=...`    -> `device="cpu"|"gpu"`
+- `show_log`       -> removed (logging redesigned)
+- `.ocr(img, cls=True)` -> `.predict(img)` (result shape changed)
+- `PPStructure`    -> `PPStructureV3`
+The public JSON response shape is kept identical to v1 so existing callers
+(PDF pipeline, HF API consumers) keep working without changes.
 """
 
-import uvicorn
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from paddleocr import PaddleOCR, PPStructure
-from PIL import Image
 import io
-import numpy as np
-from enum import Enum
-from typing import List, Dict, Any
 import logging
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import uvicorn
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from paddleocr import PaddleOCR, PPStructureV3
+from PIL import Image
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+PADDLEOCR_VERSION = "3.7.0"
+SERVICE_VERSION = "2.0.0"
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Sparksverse PaddleOCR API",
-    description="High-accuracy OCR service powered by PaddleOCR 3.0.3 (PP-OCRv5)",
-    version="1.0.0",
+    description="High-accuracy OCR service powered by PaddleOCR 3.x (PP-OCRv5)",
+    version=SERVICE_VERSION,
     docs_url="/",
 )
 
@@ -41,8 +53,9 @@ app.add_middleware(
 )
 
 # Configuration
-USE_GPU = False  # Set to True if GPU is available
-OUTPUT_DIR = 'output'
+# PaddleOCR 3.x removed `use_gpu`; use `device` instead ("cpu" or "gpu").
+DEVICE = "cpu"
+
 
 # Language options
 class LangEnum(str, Enum):
@@ -52,37 +65,66 @@ class LangEnum(str, Enum):
     korean = "korean"  # Korean
     chinese_cht = "chinese_cht"  # Traditional Chinese
 
-# OCR instance cache
+
+# Engine caches
 ocr_cache: Dict[str, PaddleOCR] = {}
-table_engine_cache: Dict[str, PPStructure] = {}
+structure_engine: Optional[PPStructureV3] = None
 
 
-def get_ocr(lang: str, use_gpu: bool = False) -> PaddleOCR:
-    """Get or create PaddleOCR instance with caching"""
-    cache_key = f"{lang}_{use_gpu}"
-    if cache_key not in ocr_cache:
-        logger.info(f"Initializing PaddleOCR for language: {lang}, GPU: {use_gpu}")
-        ocr_cache[cache_key] = PaddleOCR(
-            use_angle_cls=True,
+def get_ocr(lang: str) -> PaddleOCR:
+    """Get or create a PaddleOCR (3.x) instance with caching."""
+    if lang not in ocr_cache:
+        logger.info(f"Initializing PaddleOCR for language: {lang}, device: {DEVICE}")
+        ocr_cache[lang] = PaddleOCR(
             lang=lang,
-            use_gpu=use_gpu,
-            show_log=False,
+            device=DEVICE,
+            use_textline_orientation=True,   # replaces 2.x use_angle_cls
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
         )
-    return ocr_cache[cache_key]
+    return ocr_cache[lang]
 
 
-def get_table_engine(lang: str, use_gpu: bool = False) -> PPStructure:
-    """Get or create PPStructure instance with caching"""
-    cache_key = f"{lang}_{use_gpu}"
-    if cache_key not in table_engine_cache:
-        logger.info(f"Initializing PPStructure for language: {lang}, GPU: {use_gpu}")
-        table_engine_cache[cache_key] = PPStructure(
-            show_log=False,
-            table=True,
-            lang=lang,
-            use_gpu=use_gpu,
+def get_structure_engine() -> PPStructureV3:
+    """Get or create the PP-StructureV3 table-recognition pipeline (cached).
+
+    PP-StructureV3 does not take a `lang` argument; it uses the multilingual
+    default models, which cover Chinese + English tables well.
+    """
+    global structure_engine
+    if structure_engine is None:
+        logger.info(f"Initializing PP-StructureV3, device: {DEVICE}")
+        structure_engine = PPStructureV3(
+            device=DEVICE,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_formula_recognition=False,
+            use_chart_recognition=False,
         )
-    return table_engine_cache[cache_key]
+    return structure_engine
+
+
+def _as_dict(res: Any) -> Dict[str, Any]:
+    """Extract the inner result dict from a PaddleOCR 3.x Result object.
+
+    3.x Result objects expose their data via the `.json` attribute as
+    {"res": {...}}. Fall back gracefully if the object is already a dict.
+    """
+    data = getattr(res, "json", None)
+    if isinstance(data, dict):
+        return data.get("res", data)
+    if isinstance(res, dict):
+        return res.get("res", res)
+    return {}
+
+
+def _to_list(value: Any) -> Any:
+    """Convert numpy arrays (and nested ones) to plain JSON-serializable lists."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return [_to_list(v) for v in value]
+    return value
 
 
 @app.get("/health")
@@ -91,8 +133,8 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Sparksverse PaddleOCR API",
-        "version": "1.0.0",
-        "paddleocr_version": "3.0.3",
+        "version": SERVICE_VERSION,
+        "paddleocr_version": PADDLEOCR_VERSION,
     }
 
 
@@ -102,14 +144,15 @@ async def ocr_recognition(
     lang: LangEnum = LangEnum.ch,
 ) -> List[Dict[str, Any]]:
     """
-    Text recognition endpoint
+    Text recognition endpoint.
 
     Args:
         file: Image file (PNG, JPG, etc.)
         lang: Language for OCR (ch, en, japan, korean, chinese_cht)
 
     Returns:
-        List of recognized text items with boxes, text, and confidence scores
+        List of recognized text items with boxes, text, and confidence scores.
+        Response shape is identical to v1: [{"boxes", "txt", "score"}].
     """
     try:
         # Read and validate image
@@ -117,36 +160,41 @@ async def ocr_recognition(
         if not contents:
             raise HTTPException(status_code=400, detail="Empty file uploaded")
 
-        # Convert to PIL Image
+        # Convert to RGB numpy array
         try:
-            image = Image.open(io.BytesIO(contents))
+            image = Image.open(io.BytesIO(contents)).convert("RGB")
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
 
-        # Get OCR instance
-        ocr = get_ocr(lang=lang.value, use_gpu=USE_GPU)
-
-        # Convert to numpy array
         img_array = np.array(image)
 
-        # Perform OCR
+        # Run OCR (3.x predict API)
         logger.info(f"Processing OCR for image: {file.filename}, language: {lang}")
-        result = ocr.ocr(img_array, cls=True)
+        ocr = get_ocr(lang=lang.value)
+        result = ocr.predict(img_array)
 
-        if not result or not result[0]:
+        if not result:
             return []
 
-        # Format results
-        final_result = []
-        for line in result[0]:
-            box = line[0]  # Bounding box coordinates
-            text_info = line[1]  # (text, confidence)
+        final_result: List[Dict[str, Any]] = []
+        for res in result:
+            data = _as_dict(res)
+            texts = data.get("rec_texts", []) or []
+            scores = data.get("rec_scores", []) or []
+            # Prefer 4-point polygons (matches v1 box shape); fall back to det polys
+            polys = data.get("rec_polys")
+            if polys is None:
+                polys = data.get("dt_polys", [])
+            polys = list(polys) if polys is not None else []
 
-            final_result.append({
-                "boxes": box,
-                "txt": text_info[0],
-                "score": float(text_info[1]),
-            })
+            for i, txt in enumerate(texts):
+                box = _to_list(polys[i]) if i < len(polys) else []
+                score = float(scores[i]) if i < len(scores) else 0.0
+                final_result.append({
+                    "boxes": box,
+                    "txt": txt,
+                    "score": score,
+                })
 
         logger.info(f"OCR completed: {len(final_result)} text items recognized")
         return final_result
@@ -164,14 +212,16 @@ async def table_recognition(
     lang: LangEnum = LangEnum.ch,
 ) -> Dict[str, Any]:
     """
-    Table recognition endpoint
+    Table recognition endpoint (PP-StructureV3).
 
     Args:
         file: Image file containing tables
-        lang: Language for OCR
+        lang: Kept for API compatibility; PP-StructureV3 uses the multilingual
+              default models and does not take a per-request language.
 
     Returns:
-        Structured table data with HTML representation
+        Structured table data with HTML representation.
+        Response shape is identical to v1: {"htmls", "bboxes", "types"}.
     """
     try:
         # Read and validate image
@@ -179,39 +229,36 @@ async def table_recognition(
         if not contents:
             raise HTTPException(status_code=400, detail="Empty file uploaded")
 
-        # Convert to PIL Image
+        # Convert to RGB numpy array
         try:
-            image = Image.open(io.BytesIO(contents))
+            image = Image.open(io.BytesIO(contents)).convert("RGB")
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
 
-        # Get table engine
-        table_engine = get_table_engine(lang=lang.value, use_gpu=USE_GPU)
-
-        # Convert to numpy array
         img_array = np.array(image)
 
-        # Perform table recognition
+        # Run table recognition (PP-StructureV3)
         logger.info(f"Processing table for image: {file.filename}, language: {lang}")
-        result = table_engine(img_array)
+        engine = get_structure_engine()
+        result = engine.predict(img_array)
 
-        # Format results
-        htmls = []
-        types = []
-        bboxes = []
+        htmls: List[str] = []
+        bboxes: List[Any] = []
+        types: List[str] = []
 
-        for item in result:
-            item_res = item.get('res', {})
-            htmls.append(item_res.get('html', ''))
-            types.append(item.get('type', ''))
-            bboxes.append(item.get('bbox', ''))
+        for res in result:
+            data = _as_dict(res)
+            for table in data.get("table_res_list", []) or []:
+                htmls.append(table.get("pred_html", ""))
+                bboxes.append(_to_list(table.get("cell_box_list", [])))
+                types.append("table")
 
-        logger.info(f"Table recognition completed: {len(result)} items found")
+        logger.info(f"Table recognition completed: {len(htmls)} tables found")
 
         return {
-            'htmls': htmls,
-            'bboxes': bboxes,
-            'types': types,
+            "htmls": htmls,
+            "bboxes": bboxes,
+            "types": types,
         }
 
     except HTTPException:
